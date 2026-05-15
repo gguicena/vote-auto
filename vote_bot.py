@@ -146,8 +146,105 @@ def _solve_image_captcha(page) -> str | None:
     return solution
 
 
-def _solve_recaptcha(page) -> bool:
-    """Résout un reCAPTCHA v2 ou hCaptcha (type Google/hCaptcha)."""
+def _recaptcha_token(page) -> str:
+    """Retourne le token g-recaptcha-response si déjà résolu, sinon ''."""
+    return page.evaluate("document.getElementById('g-recaptcha-response')?.value || ''")
+
+
+def _solve_recaptcha_free(page) -> bool:
+    """
+    Tente de résoudre reCAPTCHA v2 GRATUITEMENT en 2 étapes :
+    1. Clic simple sur la checkbox (passe souvent avec un navigateur stealth)
+    2. Si défi → audio challenge + Google Speech API (gratuit, sans clé)
+    Retourne True si résolu, False sinon.
+    """
+    # ── Étape 1 : clic simple sur la checkbox ──
+    try:
+        # La checkbox est dans un iframe reCAPTCHA
+        cb_frame = page.frame_locator("iframe[src*='recaptcha'][title*='reCAPTCHA']").first
+        cb_frame.locator(".recaptcha-checkbox-border").click(timeout=5000)
+        log.info("Checkbox reCAPTCHA cliquée — attente du résultat…")
+        _sleep(4, 6)
+
+        if _recaptcha_token(page):
+            log.info("reCAPTCHA passé avec un simple clic (navigateur stealth).")
+            return True
+    except Exception as e:
+        log.debug(f"Checkbox reCAPTCHA : {e}")
+
+    # ── Étape 2 : défi audio ──
+    log.info("Défi reCAPTCHA affiché — tentative audio gratuite…")
+    try:
+        ch_frame = page.frame_locator("iframe[src*='recaptcha/api2/bframe']").first
+
+        # Clique sur le bouton audio
+        ch_frame.locator("#recaptcha-audio-button").click(timeout=5000)
+        _sleep(2, 3)
+
+        # Récupère le lien de téléchargement de l'audio
+        audio_href = ch_frame.locator(".rc-audiochallenge-tdownload-link").get_attribute("href", timeout=5000)
+        if not audio_href:
+            log.warning("Lien audio reCAPTCHA introuvable.")
+            return False
+
+        # Télécharge le MP3
+        mp3_path = Path(f"recaptcha_audio_{int(time.time())}.mp3")
+        urllib.request.urlretrieve(audio_href, mp3_path)
+        log.info(f"Audio téléchargé : {mp3_path}")
+
+        # Transcrit via SpeechRecognition + Google Web Speech (gratuit)
+        try:
+            import speech_recognition as sr
+
+            recognizer = sr.Recognizer()
+
+            # Convertit MP3 → WAV via pydub (si disponible) sinon essaie directement
+            wav_path = mp3_path.with_suffix(".wav")
+            try:
+                from pydub import AudioSegment
+                AudioSegment.from_mp3(str(mp3_path)).export(str(wav_path), format="wav")
+                audio_file = wav_path
+            except Exception:
+                audio_file = mp3_path   # essaie quand même
+
+            with sr.AudioFile(str(audio_file)) as source:
+                audio_data = recognizer.record(source)
+
+            text = recognizer.recognize_google(audio_data, language="en-US").lower().strip()
+            log.info(f"Audio transcrit : '{text}'")
+
+            # Tape la réponse dans le champ
+            ch_frame.locator("#audio-response").fill(text)
+            _sleep(0.5, 1.0)
+            ch_frame.locator("#recaptcha-verify-button").click()
+            _sleep(3, 5)
+
+            if _recaptcha_token(page):
+                log.info("reCAPTCHA résolu via audio gratuit !")
+                return True
+            else:
+                log.warning("Transcription incorrecte ou rejetée.")
+
+        except ImportError:
+            log.warning("SpeechRecognition non installé — audio gratuit indisponible.")
+        except Exception as e:
+            log.warning(f"Erreur transcription audio : {e}")
+
+        # Nettoyage
+        for f in [mp3_path, mp3_path.with_suffix(".wav")]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.warning(f"Erreur défi audio : {e}")
+
+    return False
+
+
+def _solve_recaptcha_2captcha(page) -> bool:
+    """Résout un reCAPTCHA v2 via 2captcha (payant, fallback)."""
     if not CAPTCHA_APIKEY:
         return False
 
@@ -155,13 +252,11 @@ def _solve_recaptcha(page) -> bool:
     if not rc:
         return False
 
-    sitekey  = rc.get_attribute("data-sitekey")
-    hcaptcha = bool(page.query_selector(".h-captcha"))
-    method   = "hcaptcha" if hcaptcha else "userrecaptcha"
-    log.info(f"reCAPTCHA détecté ({method}) — envoi à 2captcha…")
+    sitekey = rc.get_attribute("data-sitekey")
+    log.info("reCAPTCHA → 2captcha (fallback payant)…")
 
     params = urllib.parse.urlencode({
-        "key": CAPTCHA_APIKEY, "method": method,
+        "key": CAPTCHA_APIKEY, "method": "userrecaptcha",
         "sitekey": sitekey, "pageurl": page.url, "json": 1,
     })
     resp = json.loads(urllib.request.urlopen(f"https://2captcha.com/in.php?{params}", timeout=15).read())
@@ -173,13 +268,28 @@ def _solve_recaptcha(page) -> bool:
     if not sol:
         return False
 
-    if hcaptcha:
-        page.evaluate(f'document.querySelector("[name=h-captcha-response]").value = "{sol}"')
-    else:
-        page.evaluate(f'document.getElementById("g-recaptcha-response").innerHTML = "{sol}"')
-    log.info("reCAPTCHA résolu et injecté.")
+    page.evaluate(f'document.getElementById("g-recaptcha-response").innerHTML = "{sol}"')
+    log.info("reCAPTCHA 2captcha injecté.")
     _sleep(0.5, 1.2)
     return True
+
+
+def _solve_recaptcha(page) -> bool:
+    """Point d'entrée : essaie gratuit d'abord, puis 2captcha en fallback."""
+    if not page.query_selector("[data-sitekey], .g-recaptcha, #recaptcha"):
+        return True  # Pas de reCAPTCHA sur cette page
+
+    # 1. Gratuit
+    if _solve_recaptcha_free(page):
+        return True
+
+    # 2. Payant (si clé dispo)
+    if CAPTCHA_APIKEY:
+        log.info("Tentative gratuite échouée → 2captcha…")
+        return _solve_recaptcha_2captcha(page)
+
+    log.warning("reCAPTCHA non résolu (pas de CAPTCHA_APIKEY en fallback).")
+    return False
 
 
 # ── Navigateur (stealth) ──────────────────────────────────────────────────────
@@ -392,8 +502,8 @@ def _vote_serveur_prive(page, context) -> bool:
         ext.close()
 
 
-# ── Site 2 : serveurs-minecraft.org (ou similaire) ───────────────────────────
-# Structure inconnue pour l'instant — mode générique + dump si raté
+# ── Site 2 : serveurs-minecraft.org ──────────────────────────────────────────
+# Structure : champ "Nom ingame" + reCAPTCHA v2 + bouton "Voter"
 
 def _vote_serveur_minecraft(page, context) -> bool:
     ext = _open_external_tab(page, context, SITE2_TEXT)
@@ -402,66 +512,62 @@ def _vote_serveur_minecraft(page, context) -> bool:
 
     try:
         _scroll(ext)
-        _sleep(1, 2)
+        _sleep(1.5, 3)
 
-        # Tente reCAPTCHA d'abord
-        _solve_recaptcha(ext)
-
-        # Tente CAPTCHA image si présent
-        captcha_text = _solve_image_captcha(ext)
-        if captcha_text:
-            for sel in ["input[name='captcha']", "input[placeholder*='captcha']",
-                        "input[placeholder*='Captcha']", ".captcha input"]:
-                inp = ext.query_selector(sel)
-                if inp:
-                    b = inp.bounding_box()
-                    if b:
-                        _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
-                    for ch in captcha_text:
-                        ext.keyboard.type(ch)
-                        time.sleep(random.uniform(0.07, 0.15))
-                    break
-
-        # Champ pseudo si présent
-        for sel in ["input[name='pseudo']", "input[name='username']",
-                    "input[placeholder*='pseudo']", "input[placeholder*='Pseudonyme']"]:
+        # Champ "Nom ingame" — rempli avec le pseudo
+        for sel in [
+            "input[placeholder*='ingame']", "input[placeholder*='Nom ingame']",
+            "input[name='pseudo']",          "input[name='username']",
+            "input[name='name']",            "input[placeholder*='pseudo']",
+        ]:
             inp = ext.query_selector(sel)
             if inp:
                 b = inp.bounding_box()
                 if b:
                     _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+                # Efface et retape
                 ext.keyboard.press("Control+a")
+                _sleep(0.1, 0.2)
+                ext.keyboard.press("Delete")
+                _sleep(0.1, 0.3)
                 for ch in USERNAME:
                     ext.keyboard.type(ch)
-                    time.sleep(random.uniform(0.07, 0.15))
-                log.info(f"Pseudo tapé sur site2")
+                    time.sleep(random.uniform(0.07, 0.16))
+                log.info(f"Nom ingame tapé : '{USERNAME}'")
                 break
 
-        _sleep(0.5, 1.2)
+        _sleep(1, 2)
 
-        # Bouton vote
+        # reCAPTCHA v2 — essai gratuit puis 2captcha en fallback
+        _solve_recaptcha(ext)
+        _sleep(1, 2)
+
+        # Bouton "Voter"
         voted = False
-        for sel in ["button:has-text('Je vote')", "button:has-text('Vote')",
-                    "a:has-text('Je vote')",       "a:has-text('Voter')",
-                    "input[type='submit']",         "button[type='submit']"]:
+        for sel in [
+            "button:has-text('Voter')", "a:has-text('Voter')",
+            "button:has-text('Vote')",  "a:has-text('Vote')",
+            "input[type='submit']",     "button[type='submit']",
+        ]:
             btn = ext.query_selector(sel)
             if btn:
                 b = btn.bounding_box()
                 if b:
                     _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
-                    _sleep(2, 4)
-                    log.info(f"Vote site2 cliqué sur {ext.url}")
+                    _sleep(3, 5)
+                    log.info(f"Bouton Voter cliqué — URL finale : {ext.url}")
                     voted = True
                     break
 
         if not voted:
-            log.warning("Bouton vote site2 introuvable — dump HTML sauvegardé.")
+            log.warning("Bouton Voter site2 introuvable — dump sauvegardé.")
             Path(f"site2_dump_{int(time.time())}.html").write_text(ext.content(), encoding="utf-8")
 
         return voted
 
     except Exception as e:
         log.warning(f"Erreur site2 : {e}")
+        Path(f"site2_error_{int(time.time())}.html").write_text(ext.content(), encoding="utf-8")
         return False
     finally:
         ext.close()
