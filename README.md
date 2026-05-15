@@ -1,45 +1,71 @@
-# vote-auto — Bot de vote NationsGlory
+# vote-auto — Bot NationsGlory
 
-Vote automatiquement sur https://nationsglory.fr/vote avec ton compte.
+Vote automatiquement chaque jour sur https://nationsglory.fr/vote pendant tout le mois.
 
-## Installation
+## Fonctionnalités
+
+- **Anti-détection** : user-agent rotatif, délais humains aléatoires, mouvements de souris simulés, patch `navigator.webdriver`
+- **CAPTCHA automatique** : résolution via 2captcha (optionnel, ~3€/mois max)
+- **Boucle mensuelle** : tourne tout le mois, vote à une heure aléatoire chaque jour
+- **Retry automatique** : 3 tentatives par jour si échec
+- **Session persistante** : garde les cookies, pas besoin de se reconnecter chaque fois
+
+---
+
+## Installation (une seule fois)
 
 ```bash
-# 1. Installe les dépendances Python
+# 1. Installe Python 3.10+  →  https://www.python.org/downloads/
+
+# 2. Installe les dépendances
 pip install -r requirements.txt
 
-# 2. Installe le navigateur Chromium pour Playwright
+# 3. Installe le navigateur
 playwright install chromium
 
-# 3. Configure tes identifiants
-cp .env.example .env
-# Édite .env avec ton pseudo et mot de passe
+# 4. Configure tes identifiants
+copy .env.example .env        # Windows
+# cp .env.example .env        # Mac/Linux
+# Ouvre .env et remplis NG_USERNAME, NG_PASSWORD (et CAPTCHA_APIKEY si tu veux)
 ```
+
+---
 
 ## Utilisation
 
-### Vote unique (maintenant)
-```bash
+### Le 1er du mois — lance le bot pour tout le mois :
+```
+python run_monthly.py
+```
+Laisse la fenêtre ouverte (ou mets-le en arrière-plan). Il tourne tout seul jusqu'à la fin du mois.
+
+### Vote unique (pour tester) :
+```
 python vote_bot.py
 ```
 
-### Vote automatique toutes les 24h
-```bash
-python schedule_vote.py
-```
+---
 
-### Avec cron (Linux/Mac) — vote tous les jours à minuit
-```bash
-crontab -e
-# Ajoute cette ligne :
-0 0 * * * cd /chemin/vers/vote-auto && python vote_bot.py >> vote_bot.log 2>&1
-```
+## CAPTCHA (optionnel mais recommandé)
 
-### Avec Task Scheduler (Windows)
-Crée une tâche planifiée qui exécute `python vote_bot.py` tous les jours.
+Si le site affiche un CAPTCHA, le bot a besoin d'une clé 2captcha :
+1. Crée un compte sur https://2captcha.com
+2. Recharge 3€ (suffisant pour plusieurs mois)
+3. Copie ta clé API dans `.env` → `CAPTCHA_APIKEY=ta_clé`
 
-## Notes
+Sans clé, le bot tente de voter quand même mais peut échouer sur les CAPTCHAs.
 
-- Le bot ouvre un vrai navigateur (visible à l'écran). Pour le cacher, mets `headless=True` dans `vote_bot.py` ligne `browser = p.chromium.launch(...)`.
-- Les logs sont dans `vote_bot.log`.
-- Si la structure du site change, le HTML de la page est sauvegardé dans `vote_page_*.html` pour débogage.
+---
+
+## Logs
+
+- `vote_bot.log`    — log de chaque session de vote
+- `scheduler.log`   — log de la boucle mensuelle
+- `vote_page_*.html` — dump HTML si le bot ne trouve pas les boutons (pour debug)
+
+---
+
+## Mode invisible (headless)
+
+Par défaut le navigateur est **visible**. Pour le cacher complètement :
+Ouvre `vote_bot.py`, ligne `headless=False` → change en `headless=True`.
