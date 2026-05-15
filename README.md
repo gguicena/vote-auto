@@ -1,1 +1,1 @@
-# vote-auto-NG
+# vote-auto
