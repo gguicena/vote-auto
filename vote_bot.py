@@ -3,10 +3,10 @@
 Bot de vote NationsGlory.
 - 2 sites : Serveur-prive (cooldown 1h30) et Serveur Minecraft (cooldown 3h)
 - Tourne en boucle tout le mois, vote dès que le cooldown est écoulé
-- Anti-détection + CAPTCHA automatique (2captcha, optionnel)
+- Anti-détection + CAPTCHA image automatique (2captcha)
 """
 
-import os, sys, time, random, logging, json, urllib.request, urllib.parse
+import os, sys, time, random, logging, json, base64, urllib.request, urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -88,7 +88,66 @@ def _scroll(page):
 
 # ── CAPTCHA (2captcha) ────────────────────────────────────────────────────────
 
-def _solve_captcha(page) -> bool:
+def _2captcha_poll(cid: str) -> str | None:
+    """Attend et retourne la solution depuis 2captcha."""
+    for _ in range(24):
+        _sleep(5, 6)
+        data = json.loads(urllib.request.urlopen(
+            f"https://2captcha.com/res.php?key={CAPTCHA_APIKEY}&action=get&id={cid}&json=1", timeout=10
+        ).read())
+        if data.get("status") == 1:
+            return data["request"]
+        if "NOT_READY" not in data.get("request", ""):
+            log.error(f"2captcha erreur : {data}")
+            return None
+    log.error("Délai 2captcha dépassé.")
+    return None
+
+
+def _solve_image_captcha(page) -> str | None:
+    """
+    Résout un CAPTCHA image texte (type serveur-prive.net).
+    Prend une capture de l'image, l'envoie à 2captcha, retourne le texte.
+    """
+    if not CAPTCHA_APIKEY:
+        log.warning("Pas de CAPTCHA_APIKEY — impossible de résoudre le CAPTCHA image.")
+        return None
+
+    # Cherche l'image CAPTCHA (essaie plusieurs sélecteurs)
+    img_elem = None
+    for sel in ["img.captcha", ".captcha img", "img[src*='captcha']", "#captcha img", "img[alt*='captcha']"]:
+        img_elem = page.query_selector(sel)
+        if img_elem:
+            break
+
+    if not img_elem:
+        log.warning("Image CAPTCHA introuvable sur la page.")
+        return None
+
+    # Screenshot de l'image uniquement → base64
+    img_bytes = img_elem.screenshot()
+    img_b64   = base64.b64encode(img_bytes).decode()
+
+    log.info("CAPTCHA image détecté — envoi à 2captcha…")
+    params = urllib.parse.urlencode({
+        "key":    CAPTCHA_APIKEY,
+        "method": "base64",
+        "body":   img_b64,
+        "json":   1,
+    })
+    resp = json.loads(urllib.request.urlopen(f"https://2captcha.com/in.php?{params}", timeout=15).read())
+    if resp.get("status") != 1:
+        log.error(f"2captcha refus image : {resp}")
+        return None
+
+    solution = _2captcha_poll(resp["request"])
+    if solution:
+        log.info(f"Solution CAPTCHA image : '{solution}'")
+    return solution
+
+
+def _solve_recaptcha(page) -> bool:
+    """Résout un reCAPTCHA v2 ou hCaptcha (type Google/hCaptcha)."""
     if not CAPTCHA_APIKEY:
         return False
 
@@ -99,7 +158,7 @@ def _solve_captcha(page) -> bool:
     sitekey  = rc.get_attribute("data-sitekey")
     hcaptcha = bool(page.query_selector(".h-captcha"))
     method   = "hcaptcha" if hcaptcha else "userrecaptcha"
-    log.info(f"CAPTCHA détecté ({method}) — envoi à 2captcha…")
+    log.info(f"reCAPTCHA détecté ({method}) — envoi à 2captcha…")
 
     params = urllib.parse.urlencode({
         "key": CAPTCHA_APIKEY, "method": method,
@@ -110,28 +169,17 @@ def _solve_captcha(page) -> bool:
         log.error(f"2captcha refus : {resp}")
         return False
 
-    cid = resp["request"]
-    log.info(f"CAPTCHA soumis id={cid}, attente solution…")
-    for _ in range(24):
-        _sleep(5, 6)
-        data = json.loads(urllib.request.urlopen(
-            f"https://2captcha.com/res.php?key={CAPTCHA_APIKEY}&action=get&id={cid}&json=1", timeout=10
-        ).read())
-        if data.get("status") == 1:
-            sol = data["request"]
-            if hcaptcha:
-                page.evaluate(f'document.querySelector("[name=h-captcha-response]").value = "{sol}"')
-            else:
-                page.evaluate(f'document.getElementById("g-recaptcha-response").innerHTML = "{sol}"')
-            log.info("Solution CAPTCHA injectée.")
-            _sleep(0.5, 1.2)
-            return True
-        if "NOT_READY" not in data.get("request", ""):
-            log.error(f"2captcha erreur : {data}")
-            return False
+    sol = _2captcha_poll(resp["request"])
+    if not sol:
+        return False
 
-    log.error("Délai CAPTCHA dépassé.")
-    return False
+    if hcaptcha:
+        page.evaluate(f'document.querySelector("[name=h-captcha-response]").value = "{sol}"')
+    else:
+        page.evaluate(f'document.getElementById("g-recaptcha-response").innerHTML = "{sol}"')
+    log.info("reCAPTCHA résolu et injecté.")
+    _sleep(0.5, 1.2)
+    return True
 
 
 # ── Navigateur (stealth) ──────────────────────────────────────────────────────
@@ -224,79 +272,199 @@ def _login(page) -> bool:
     return True
 
 
-# ── Vote sur un site ──────────────────────────────────────────────────────────
+# ── Ouverture d'un onglet externe depuis un bouton NationsGlory ──────────────
 
-def _click_vote_button(page, context, label: str) -> bool:
-    """Clique sur le bouton de vote correspondant au label et vote sur la page externe."""
+def _open_external_tab(page, context, label: str):
+    """Clique sur le bouton NationsGlory et retourne la page externe ouverte."""
     page.goto(VOTE_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
     _sleep(1.5, 3)
     _scroll(page)
 
-    # Cherche le bouton par texte
     btn = page.query_selector(f"a:has-text('{label}'), button:has-text('{label}')")
     if not btn:
-        log.warning(f"Bouton '{label}' introuvable.")
-        return False
+        log.warning(f"Bouton '{label}' introuvable sur la page de vote.")
+        return None
 
-    # Vérifie si le bouton est actif (pas de cooldown actif = pas de point orange visible)
-    btn_text = btn.inner_text()
-    log.info(f"Bouton trouvé : '{btn_text.strip()}'")
-
+    log.info(f"Bouton trouvé : '{btn.inner_text().strip()}'")
     box = btn.bounding_box()
     if not box:
-        return False
+        return None
 
     cx = box["x"] + box["width"]  * random.uniform(0.35, 0.65)
     cy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
 
-    # Ouvre le lien dans un nouvel onglet
     try:
         with context.expect_page(timeout=TIMEOUT) as new_page_info:
             _human_click(page, cx, cy)
         ext = new_page_info.value
     except Exception:
-        # Essai en forçant l'ouverture
         href = btn.get_attribute("href") or ""
         if not href:
             log.warning("Pas de href sur le bouton.")
-            return False
+            return None
         ext = context.new_page()
         ext.goto(href, wait_until="domcontentloaded", timeout=TIMEOUT)
 
     ext.wait_for_load_state("domcontentloaded", timeout=TIMEOUT)
-    _sleep(2, 4)
-    _scroll(ext)
-    log.info(f"Page externe ouverte : {ext.url}")
+    _sleep(2, 3)
+    log.info(f"Page externe : {ext.url}")
+    return ext
 
-    # Résout le CAPTCHA si présent
-    _solve_captcha(ext)
-    _sleep(0.5, 1.5)
 
-    # Cherche et clique le bouton de vote sur la page externe
-    voted = False
-    for sel in [
-        "button:has-text('Vote')", "button:has-text('Voter')",
-        "a:has-text('Vote')",      "a:has-text('Voter')",
-        "input[type='submit']",    "button[type='submit']",
-        ".vote-btn", "#vote-btn",  ".btn-vote",
-    ]:
-        elem = ext.query_selector(sel)
-        if elem:
-            b = elem.bounding_box()
-            if b:
-                _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
-                _sleep(2, 4)
-                log.info(f"Vote cliqué sur {ext.url}")
-                voted = True
+# ── Site 1 : serveur-prive.net ────────────────────────────────────────────────
+# Structure : CAPTCHA image texte + champ Pseudonyme + bouton "Je vote maintenant"
+
+def _vote_serveur_prive(page, context) -> bool:
+    ext = _open_external_tab(page, context, SITE1_TEXT)
+    if not ext:
+        return False
+
+    try:
+        _scroll(ext)
+        _sleep(1, 2)
+
+        # Résout le CAPTCHA image (ex: "UQWU")
+        captcha_text = _solve_image_captcha(ext)
+
+        # Champ CAPTCHA texte
+        captcha_input = None
+        for sel in ["input[name='captcha']", "input[placeholder*='captcha']",
+                    "input[placeholder*='Captcha']", ".captcha input", "#captcha"]:
+            captcha_input = ext.query_selector(sel)
+            if captcha_input:
                 break
 
-    if not voted:
-        log.warning(f"Pas de bouton vote trouvé sur {ext.url} — dump sauvegardé.")
-        Path(f"ext_vote_{label.replace(' ','_')}_{int(time.time())}.html").write_text(ext.content(), encoding="utf-8")
+        if captcha_text and captcha_input:
+            b = captcha_input.bounding_box()
+            if b:
+                _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+            _sleep(0.3, 0.6)
+            for ch in captcha_text:
+                ext.keyboard.type(ch)
+                time.sleep(random.uniform(0.07, 0.15))
+            log.info(f"CAPTCHA tapé : '{captcha_text}'")
+        elif not captcha_text:
+            log.warning("CAPTCHA image non résolu (pas de clé 2captcha ?).")
 
-    _sleep(1, 2)
-    ext.close()
-    return voted
+        # Champ Pseudonyme
+        for sel in ["input[name='pseudo']", "input[placeholder*='Pseudonyme']",
+                    "input[placeholder*='pseudo']", "input[name='username']"]:
+            pseudo_input = ext.query_selector(sel)
+            if pseudo_input:
+                b = pseudo_input.bounding_box()
+                if b:
+                    _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+                _sleep(0.2, 0.5)
+                # Efface d'abord
+                ext.keyboard.press("Control+a")
+                ext.keyboard.press("Delete")
+                _sleep(0.1, 0.3)
+                for ch in USERNAME:
+                    ext.keyboard.type(ch)
+                    time.sleep(random.uniform(0.07, 0.15))
+                log.info(f"Pseudonyme tapé : '{USERNAME}'")
+                break
+
+        _sleep(0.5, 1.2)
+
+        # Bouton "Je vote maintenant"
+        for sel in ["button:has-text('Je vote maintenant')", "a:has-text('Je vote maintenant')",
+                    "input[type='submit']", "button[type='submit']", ".btn-vote"]:
+            btn = ext.query_selector(sel)
+            if btn:
+                b = btn.bounding_box()
+                if b:
+                    _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+                    _sleep(2, 4)
+                    log.info("Bouton 'Je vote maintenant' cliqué.")
+                    break
+
+        # Vérifie succès (page redirige vers classement ou affiche confirmation)
+        _sleep(2, 3)
+        log.info(f"Après vote site1 : {ext.url}")
+        return True
+
+    except Exception as e:
+        log.warning(f"Erreur site1 : {e}")
+        Path(f"site1_error_{int(time.time())}.html").write_text(ext.content(), encoding="utf-8")
+        return False
+    finally:
+        ext.close()
+
+
+# ── Site 2 : serveurs-minecraft.org (ou similaire) ───────────────────────────
+# Structure inconnue pour l'instant — mode générique + dump si raté
+
+def _vote_serveur_minecraft(page, context) -> bool:
+    ext = _open_external_tab(page, context, SITE2_TEXT)
+    if not ext:
+        return False
+
+    try:
+        _scroll(ext)
+        _sleep(1, 2)
+
+        # Tente reCAPTCHA d'abord
+        _solve_recaptcha(ext)
+
+        # Tente CAPTCHA image si présent
+        captcha_text = _solve_image_captcha(ext)
+        if captcha_text:
+            for sel in ["input[name='captcha']", "input[placeholder*='captcha']",
+                        "input[placeholder*='Captcha']", ".captcha input"]:
+                inp = ext.query_selector(sel)
+                if inp:
+                    b = inp.bounding_box()
+                    if b:
+                        _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+                    for ch in captcha_text:
+                        ext.keyboard.type(ch)
+                        time.sleep(random.uniform(0.07, 0.15))
+                    break
+
+        # Champ pseudo si présent
+        for sel in ["input[name='pseudo']", "input[name='username']",
+                    "input[placeholder*='pseudo']", "input[placeholder*='Pseudonyme']"]:
+            inp = ext.query_selector(sel)
+            if inp:
+                b = inp.bounding_box()
+                if b:
+                    _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+                ext.keyboard.press("Control+a")
+                for ch in USERNAME:
+                    ext.keyboard.type(ch)
+                    time.sleep(random.uniform(0.07, 0.15))
+                log.info(f"Pseudo tapé sur site2")
+                break
+
+        _sleep(0.5, 1.2)
+
+        # Bouton vote
+        voted = False
+        for sel in ["button:has-text('Je vote')", "button:has-text('Vote')",
+                    "a:has-text('Je vote')",       "a:has-text('Voter')",
+                    "input[type='submit']",         "button[type='submit']"]:
+            btn = ext.query_selector(sel)
+            if btn:
+                b = btn.bounding_box()
+                if b:
+                    _human_click(ext, b["x"] + b["width"]/2, b["y"] + b["height"]/2)
+                    _sleep(2, 4)
+                    log.info(f"Vote site2 cliqué sur {ext.url}")
+                    voted = True
+                    break
+
+        if not voted:
+            log.warning("Bouton vote site2 introuvable — dump HTML sauvegardé.")
+            Path(f"site2_dump_{int(time.time())}.html").write_text(ext.content(), encoding="utf-8")
+
+        return voted
+
+    except Exception as e:
+        log.warning(f"Erreur site2 : {e}")
+        return False
+    finally:
+        ext.close()
 
 
 # ── Session de vote (les 2 sites) ─────────────────────────────────────────────
@@ -306,18 +474,12 @@ def vote_session(page, context, do_site1: bool, do_site2: bool):
 
     if do_site1:
         log.info("=== Vote Serveur-prive ===")
-        try:
-            results["site1"] = _click_vote_button(page, context, SITE1_TEXT)
-        except Exception as e:
-            log.warning(f"Erreur site1 : {e}")
+        results["site1"] = _vote_serveur_prive(page, context)
         _sleep(5, 12)
 
     if do_site2:
         log.info("=== Vote Serveur Minecraft ===")
-        try:
-            results["site2"] = _click_vote_button(page, context, SITE2_TEXT)
-        except Exception as e:
-            log.warning(f"Erreur site2 : {e}")
+        results["site2"] = _vote_serveur_minecraft(page, context)
 
     return results
 
